@@ -1,6 +1,6 @@
 ---
 name: pr-review-loop
-description: Automate GitHub PR review workflows with configurable reviewers. Use this skill whenever you need to handle PR code reviews at scale, loop through multiple reviewer feedback cycles, address all review comments, ensure tests and CI pass, and keep iterating until all reviews are resolved. Supports any number of reviewers and a coder role. Configure reviewer names, comment triggers, and token names as inputs. Triggers on requests to "automate PR reviews", "handle code reviews", "process PR feedback loops", "CI/review loop", or similar workflows involving iterative review resolution.
+description: Automate GitHub PR review workflows with configurable reviewers. Use this skill whenever you need to handle PR code reviews at scale, loop through multiple reviewer feedback cycles, address all review comments, ensure tests and CI pass, and keep iterating until all reviews are resolved. Supports any number of reviewers and a coder role. Configure reviewer names, comment triggers, token names, and out-of-scope rejection threshold as inputs. Triggers on requests to "automate PR reviews", "handle code reviews", "process PR feedback loops", "CI/review loop", or similar workflows involving iterative review resolution.
 ---
 
 # PR Review Loop Automation
@@ -38,7 +38,8 @@ Before starting the workflow, gather the following information:
 | Reviewer 2 Trigger | `/reviewer2 review` | Comment text to request review from reviewer 2 |
 | Reviewer 2 Token Var | `REVIEWER2_PR_TOKEN` | Environment variable name for reviewer 2's token |
 | Coder Name | `coder` | Internal name for the coder role |
-| Coder Token Var | `CODER_PR_TOKEN` | Environment variable name for coder's token (for posting 👍) |
+| Coder Token Var | `CODER_PR_TOKEN` | Environment variable name for coder's token (for posting 👍/👎) |
+| Max Out-of-Scope | `3` | Max rejected out-of-scope reviews before terminating the loop (default: 3) |
 
 Add additional rows for more reviewers as needed.
 
@@ -47,16 +48,19 @@ Add additional rows for more reviewers as needed.
 The skill runs a loop that:
 1. Requests reviews from configured reviewers if previous changes have been addressed
 2. Waits for and fetches unresolved review comments
-3. Addresses feedback by making code changes
-4. Verifies tests pass and CI is green
-5. Posts 👍 reactions to addressed comments (using coder token)
-6. Loops until no unresolved comments remain
+3. Evaluates each comment against the PR/issue scope
+4. Rejects out-of-scope comments with 👎 reactions and explanatory comments
+5. Addresses in-scope feedback by making code changes
+6. Verifies tests pass and CI is green
+7. Posts 👍 reactions to addressed comments (using coder token)
+8. Loops until no unresolved in-scope comments remain
 
 The loop **terminates early** if:
 - No unresolved comments are found
 - Authentication error occurs (will stop immediately)
 - Rate limit is reached
 - Token limit is exceeded
+- Out-of-scope rejection count exceeds `max_out_of_scope` threshold (default: 3)
 
 ## Step-by-Step Workflow
 
@@ -91,10 +95,53 @@ Filter for:
 - An API call returned HTTP 401 (Unauthorized) → Auth error, stop immediately and report
 - An API call returned HTTP 429 (Rate Limit Exceeded) → Stop and report rate limit reached
 - Token limit exceeded in your context → Stop and report
+- Out-of-scope rejection count ≥ `max_out_of_scope` (default: 3) → Reviewer misalignment detected, stop and report
 
-### Step 4: Address Review Feedback
+### Step 4: Evaluate Comment Scope
 
-For each unresolved comment:
+Before addressing any comment, evaluate whether it falls within the original PR/issue scope:
+
+1. Fetch the PR description and linked issue (if any) to understand the intended scope:
+   ```bash
+   curl -s "https://api.github.com/repos/<owner>/<repo>/pulls/<pr_number>"
+   ```
+2. For each unresolved comment, compare the requested change against the PR/issue scope:
+   - **In scope**: Directly related to the PR's stated goal, bug fix, or feature
+   - **Out of scope**: Security hardening unrelated to the PR, refactoring beyond the PR goal, unrelated feature additions, style changes not required by the PR, infrastructure changes not mentioned in the PR
+
+3. **For out-of-scope comments**:
+   a. Post a 👎 reaction using the coder's token:
+      ```bash
+      TOKEN=$(python3 -c "import os; print(os.environ.get('<CODER_TOKEN_VAR>',''))")
+      RESULT=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{"content": "-1"}' \
+        "https://api.github.com/repos/<owner>/<repo>/pulls/comments/<comment_id>/reactions")
+      echo "HTTP $RESULT"
+      ```
+   b. Post an explanatory comment reply using the coder's token:
+      ```bash
+      TOKEN=$(python3 -c "import os; print(os.environ.get('<CODER_TOKEN_VAR>',''))")
+      curl -s -X POST \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{"body": "Out of scope for this PR. Tracked separately."}' \
+        "https://api.github.com/repos/<owner>/<repo>/issues/<pr_number>/comments"
+      ```
+   c. Increment the out-of-scope rejection counter
+   d. Record the out-of-scope item for future reference (note the comment ID, reviewer, and description)
+   e. **Skip** implementing the change — do not modify the code for this comment
+
+4. **If HTTP 401 or 429** when posting the reaction/comment: Stop loop immediately
+
+5. Check termination: if rejection counter ≥ `max_out_of_scope`, stop the loop and report all collected out-of-scope items
+
+6. Continue to Step 5 only with **in-scope** comments
+
+### Step 5: Address In-Scope Review Feedback
+
+For each unresolved **in-scope** comment:
 1. Read the review comment text
 2. Understand what needs to be fixed
 3. Make the necessary code changes to the repo
@@ -102,7 +149,7 @@ For each unresolved comment:
 5. Commit changes with a descriptive message (reference the PR and comment if possible)
 6. Push changes to the PR branch
 
-### Step 5: Verify CI Status
+### Step 6: Verify CI Status
 
 After pushing:
 1. Wait for CI to run
@@ -114,9 +161,9 @@ After pushing:
 3. If CI is **failing**: Diagnose the failure and make additional commits to fix it
 4. If CI is **passing**: Proceed to next step
 
-### Step 6: Post Reactions
+### Step 7: Post Reactions
 
-For each comment you've addressed:
+For each in-scope comment you've addressed:
 1. Extract the comment ID
 2. Post a 👍 reaction using the coder's token (`<CODER_NAME>_PR_TOKEN`):
    ```bash
@@ -124,7 +171,7 @@ For each comment you've addressed:
    RESULT=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
      -H "Authorization: Bearer $TOKEN" \
      -H "Content-Type: application/json" \
-     -d '{"content": "👍"}' \
+     -d '{"content": "+1"}' \
      "https://api.github.com/repos/<owner>/<repo>/pulls/comments/<comment_id>/reactions")
    echo "HTTP $RESULT"
    ```
@@ -133,11 +180,13 @@ For each comment you've addressed:
 3. If HTTP 401: Stop loop immediately (auth error)
 4. If HTTP 429: Stop loop immediately (rate limit reached)
 
-### Step 7: Loop Back
+### Step 8: Loop Back
 
-If you've successfully posted 👍 reactions and there are no more unresolved comments, go back to **Step 1** and request new reviews from the configured reviewers.
+If you've successfully posted 👍 reactions and there are no more unresolved in-scope comments, go back to **Step 1** and request new reviews from the configured reviewers.
 
 Otherwise, return to **Step 2** to fetch updated comment status.
+
+If the loop terminates due to exceeding `max_out_of_scope`, report a summary of all collected out-of-scope items so they can be tracked as separate issues or PRs.
 
 ## Important Notes
 
@@ -162,8 +211,17 @@ Only address comments that are:
 - Unresolved (not closed/resolved in the PR UI)
 - Not outdated (created/updated after the last applicable commit)
 - Do not have a 👍 reaction from the coder yet
+- Evaluated as **in scope** for the current PR (see Step 4)
 
-Comments marked as resolved or outdated should be skipped.
+Comments marked as resolved, outdated, or out-of-scope should be skipped.
+
+### Out-of-Scope Detection
+When evaluating scope, consider the PR title, description, and linked issue as the source of truth:
+- A comment is **in scope** if it directly relates to the bug fix, feature, or change described in the PR
+- A comment is **out of scope** if it requests unrelated security hardening, refactoring, style changes, or new features not mentioned in the PR
+- When in doubt, err on the side of addressing the comment (bias toward in-scope)
+- Out-of-scope items are collected and can be used to create follow-up issues after the loop ends
+- The `max_out_of_scope` threshold (default: 3) prevents infinite loops caused by persistent reviewer misalignment; adjust it upward if your workflow expects many advisory comments
 
 ### Reviewer Configuration Notes
 - Reviewer names and triggers are flexible and can be customized for your workflow
@@ -193,14 +251,34 @@ curl -s -X POST \
   "https://api.github.com/repos/OWNER/REPO/pulls/PR_NUMBER/comments"
 ```
 
-### Post Reaction to Comment
+### Post 👍 Reaction to Comment (in-scope, addressed)
 ```bash
 TOKEN=$(python3 -c "import os; print(os.environ.get('TOKEN_VAR',''))")
 curl -s -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"content": "👍"}' \
+  -d '{"content": "+1"}' \
   "https://api.github.com/repos/OWNER/REPO/pulls/comments/COMMENT_ID/reactions"
+```
+
+### Post 👎 Reaction to Comment (out-of-scope, rejected)
+```bash
+TOKEN=$(python3 -c "import os; print(os.environ.get('TOKEN_VAR',''))")
+curl -s -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"content": "-1"}' \
+  "https://api.github.com/repos/OWNER/REPO/pulls/comments/COMMENT_ID/reactions"
+```
+
+### Post Explanatory Comment on PR Issue (out-of-scope rejection)
+```bash
+TOKEN=$(python3 -c "import os; print(os.environ.get('TOKEN_VAR',''))")
+curl -s -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"body": "Out of scope for this PR. Tracked separately."}' \
+  "https://api.github.com/repos/OWNER/REPO/issues/PR_NUMBER/comments"
 ```
 
 ## Debugging
@@ -213,3 +291,5 @@ If something goes wrong:
 5. Ensure commit messages are meaningful for audit trail
 6. Verify reviewer names and triggers match your configuration
 7. Confirm coder token variable name is correct when posting reactions
+8. If the loop terminates due to `max_out_of_scope` threshold: review the collected out-of-scope items and consider creating separate issues for them; increase the threshold if the reviewer's suggestions are broadly acceptable
+9. If a comment was incorrectly classified as out-of-scope: re-run the loop after adjusting the scope evaluation logic or increase `max_out_of_scope`
