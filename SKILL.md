@@ -66,6 +66,22 @@ The loop **terminates early** if:
 
 ### Step 1: Request Reviews (if needed)
 
+**Before posting any review trigger**, check for pending reviews that need to be addressed first:
+
+```bash
+curl -s "https://api.github.com/repos/<owner>/<repo>/pulls/<pr_number>/comments"
+```
+
+If there are any comments that are **all of the following**:
+- Not outdated
+- Not resolved
+- Have **no 👍 reaction** from the coder
+- Have **no 👎 reaction** from the coder
+
+Then **skip posting review triggers** and go directly to **Step 2** to address the existing pending reviews first. Do not request new reviews while actionable reviews remain unhandled.
+
+Only if **no such pending reviews exist**, proceed to post review triggers:
+
 For each configured reviewer:
 
 **If you've posted changes to the previous review from that reviewer** and there are no unresolved review comments:
@@ -120,15 +136,16 @@ Before addressing any comment, evaluate whether it falls within the original PR/
         "https://api.github.com/repos/<owner>/<repo>/pulls/comments/<comment_id>/reactions")
       echo "HTTP $RESULT"
       ```
-   b. Post an explanatory comment reply using the coder's token:
+   b. Post an inline reply **directly to the review comment** (not the main PR thread) using the coder's token:
       ```bash
       TOKEN=$(python3 -c "import os; print(os.environ.get('<CODER_TOKEN_VAR>',''))")
       curl -s -X POST \
         -H "Authorization: Bearer $TOKEN" \
         -H "Content-Type: application/json" \
-        -d '{"body": "Out of scope for this PR. Tracked separately."}' \
-        "https://api.github.com/repos/<owner>/<repo>/issues/<pr_number>/comments"
+        -d '{"body": "Out of scope for this PR. Tracked separately.", "in_reply_to": <comment_id>}' \
+        "https://api.github.com/repos/<owner>/<repo>/pulls/<pr_number>/comments"
       ```
+      > **Important**: Reply inline to the specific review comment (using `in_reply_to`) rather than posting to the main PR issue thread. This preserves context and keeps rejection messages attached to the comment they respond to.
    c. Increment the out-of-scope rejection counter
    d. Record the out-of-scope item for future reference (note the comment ID, reviewer, and description)
    e. **Skip** implementing the change — do not modify the code for this comment
@@ -187,6 +204,31 @@ If you've successfully posted 👍 reactions and there are no more unresolved in
 Otherwise, return to **Step 2** to fetch updated comment status.
 
 If the loop terminates due to exceeding `max_out_of_scope`, report a summary of all collected out-of-scope items so they can be tracked as separate issues or PRs.
+
+### Step 9: Final Sweep After Termination
+
+When the loop ends for **any reason** (no reviews remaining, out-of-scope limit reached, or other termination condition), perform a final verification before declaring completion:
+
+1. Wait briefly (3–5 seconds) to allow any in-flight reviews to arrive
+2. Re-fetch all PR comments:
+   ```bash
+   curl -s "https://api.github.com/repos/<owner>/<repo>/pulls/<pr_number>/comments"
+   ```
+3. Check for any comments that are:
+   - Not outdated
+   - Not resolved
+   - Have **no 👍 reaction** from the coder
+   - Have **no 👎 reaction** from the coder
+
+4. If such comments exist:
+   - Evaluate their scope (Step 4)
+   - Address any in-scope comments (Steps 5–7) — **without** posting new review triggers
+   - Reject out-of-scope comments with 👎 and inline replies (Step 4) — **without** posting new review triggers
+   - **Do not loop back to Step 1 or trigger new reviews during the final sweep**
+
+5. Once no unhandled comments remain (or all remaining are handled), report the final status and exit.
+
+> **Note**: No review triggers should occur during the final sweep. The goal is only to catch and handle any comments that arrived after the loop's last check.
 
 ## Important Notes
 
@@ -271,15 +313,16 @@ curl -s -X POST \
   "https://api.github.com/repos/OWNER/REPO/pulls/comments/COMMENT_ID/reactions"
 ```
 
-### Post Explanatory Comment on PR Issue (out-of-scope rejection)
+### Post Inline Reply to Review Comment (out-of-scope rejection)
 ```bash
 TOKEN=$(python3 -c "import os; print(os.environ.get('TOKEN_VAR',''))")
 curl -s -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"body": "Out of scope for this PR. Tracked separately."}' \
-  "https://api.github.com/repos/OWNER/REPO/issues/PR_NUMBER/comments"
+  -d '{"body": "Out of scope for this PR. Tracked separately.", "in_reply_to": COMMENT_ID}' \
+  "https://api.github.com/repos/OWNER/REPO/pulls/PR_NUMBER/comments"
 ```
+> Replies inline to the specific review comment rather than posting to the main PR thread, preserving context.
 
 ## Debugging
 
